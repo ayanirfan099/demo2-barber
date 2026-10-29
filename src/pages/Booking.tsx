@@ -7,7 +7,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../lib/app-context';
 import { SERVICES, BARBERS, getService, getBarber, HOURS, viennaNow, addDaysISO } from '../lib/data';
-import { createAppointment, getSlots } from '../lib/store';
+import { createAppointment, getSlots, type SlotInfo } from '../lib/store';
 import { Kicker } from '../components/Shared';
 import Logo from '../components/Logo';
 
@@ -100,10 +100,20 @@ export default function Booking() {
     return viewMonth.y > ty || (viewMonth.y === ty && viewMonth.m > tm - 1);
   })();
 
-  const slots = useMemo(
-    () => (dateISO && serviceId && barberId ? getSlots(dateISO, serviceId, barberId) : []),
-    [dateISO, serviceId, barberId]
-  );
+  const [slots, setSlots] = useState<SlotInfo[]>([]);
+  useEffect(() => {
+    let alive = true;
+    if (dateISO && serviceId && barberId) {
+      getSlots(dateISO, serviceId, barberId).then((s) => {
+        if (alive) setSlots(s);
+      });
+    } else {
+      setSlots([]);
+    }
+    return () => {
+      alive = false;
+    };
+  }, [dateISO, serviceId, barberId]);
   const dateClosed = (() => {
     if (!dateISO) return false;
     const [y, m, d] = dateISO.split('-').map(Number);
@@ -126,27 +136,25 @@ export default function Booking() {
     return Object.keys(next).length === 0;
   };
 
-  const submit = () => {
+  const submit = async () => {
     if (!serviceId || !barberId || !dateISO || !time) return;
     if (!validateDetails()) return;
     setSaving(true);
     setSubmitError(null);
-    window.setTimeout(() => {
-      const result = createAppointment({ serviceId, barberId, dateISO, time, name: name.trim(), email: email.trim(), phone: phone.trim(), note: note.trim() });
-      setSaving(false);
-      if (result.ok) {
-        setDoneRef(result.appointment.id);
-        try { sessionStorage.removeItem(DRAFT_KEY); } catch { /* ignore */ }
-        toast(t('toast.saved'), 'success');
-        window.scrollTo({ top: 0, behavior: 'smooth' });
-      } else {
-        setSubmitError(result.reason === 'conflict' ? t('book.conflict') : result.reason === 'duplicate' ? t('book.duplicate') : t('book.invalid'));
-        if (result.reason === 'conflict') {
-          setTime(null);
-          setStep(3);
-        }
+    const result = await createAppointment({ serviceId, barberId, dateISO, time, name: name.trim(), email: email.trim(), phone: phone.trim(), note: note.trim() });
+    setSaving(false);
+    if (result.ok) {
+      setDoneRef(result.appointment.id);
+      try { sessionStorage.removeItem(DRAFT_KEY); } catch { /* ignore */ }
+      toast(t('toast.saved'), 'success');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } else {
+      setSubmitError(result.reason === 'conflict' ? t('book.conflict') : result.reason === 'duplicate' ? t('book.duplicate') : t('book.invalid'));
+      if (result.reason === 'conflict') {
+        setTime(null);
+        setStep(3);
       }
-    }, 650);
+    }
   };
 
   const resetAll = () => {

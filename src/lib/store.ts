@@ -1,5 +1,7 @@
-/* ── Appointment store — REAL persistence in the browser (localStorage).
-   Labeled demo: no server, no network. Reservations live on this device. ── */
+/* ── Appointment store — Supabase-backed with localStorage demo fallback. ──
+   If VITE_SUPABASE_URL / VITE_SUPABASE_PUBLISHABLE_KEY are set, bookings
+   live in the shared Supabase database. Otherwise it falls back to the
+   original per-device localStorage demo. ─────────────────────────────────── */
 
 import {
   Appointment,
@@ -11,10 +13,58 @@ import {
   addDaysISO,
   HOURS,
 } from './data';
+import { supabase } from './supabase';
 
 const KEY = 'vienna-cuts-appointments-v1';
 
-/* ── Deterministic seed for the owner dashboard demo ─────────────────────── */
+/* ── Row mapping: Supabase `bookings` table ↔ Appointment ────────────────── */
+
+interface BusyRow {
+  id: string;
+  service_id: string;
+  barber_id: string;
+  date_iso: string;
+  time: string;
+  status: ApptStatus;
+}
+
+interface BookingRow extends BusyRow {
+  name: string;
+  email: string;
+  phone: string | null;
+  note: string | null;
+  created_at_ms: number | null;
+}
+
+const rowToAppt = (r: Partial<BookingRow> & BusyRow): Appointment => ({
+  id: r.id,
+  serviceId: r.service_id,
+  barberId: r.barber_id,
+  dateISO: r.date_iso,
+  time: r.time,
+  name: r.name ?? '',
+  email: r.email ?? '',
+  phone: r.phone ?? '',
+  note: r.note ?? '',
+  status: r.status,
+  createdAt: Number(r.created_at_ms) || 0,
+});
+
+const apptToRow = (a: Appointment) => ({
+  id: a.id,
+  service_id: a.serviceId,
+  barber_id: a.barberId as string,
+  date_iso: a.dateISO,
+  time: a.time,
+  name: a.name,
+  email: a.email,
+  phone: a.phone,
+  note: a.note,
+  status: a.status,
+  created_at_ms: a.createdAt,
+});
+
+/* ── Deterministic seed for the localStorage demo mode ───────────────────── */
 function seedAppointments(): Appointment[] {
   const { dateISO } = viennaNow();
   const mk = (
@@ -59,7 +109,9 @@ function seedAppointments(): Appointment[] {
   ];
 }
 
-export function loadAppointments(): Appointment[] {
+/* ── localStorage helpers (demo mode) ───────────────────────────────────── */
+
+function loadLocal(): Appointment[] {
   try {
     const raw = localStorage.getItem(KEY);
     if (raw) return JSON.parse(raw) as Appointment[];
@@ -71,12 +123,45 @@ export function loadAppointments(): Appointment[] {
   }
 }
 
-export function saveAppointments(list: Appointment[]) {
+function saveLocal(list: Appointment[]) {
   try {
     localStorage.setItem(KEY, JSON.stringify(list));
   } catch {
     /* storage full/unavailable — in-memory state still works for the session */
   }
+}
+
+/* ── Loaders ────────────────────────────────────────────────────────────── */
+
+/** Full appointment rows (name/email/phone/note) — for the owner dashboard (signed-in). */
+export async function loadAppointments(): Promise<Appointment[]> {
+  if (supabase) {
+    const { data, error } = await supabase
+      .from('bookings')
+      .select('*')
+      .order('created_at_ms', { ascending: false });
+    if (error) {
+      console.error('[Vienna Cuts] loadAppointments:', error.message);
+      return [];
+    }
+    return (data as BookingRow[]).map(rowToAppt);
+  }
+  return loadLocal();
+}
+
+/** Anonymously-safe load (no PII columns) — powers the availability engine. */
+async function loadBusy(): Promise<Appointment[]> {
+  if (supabase) {
+    const { data, error } = await supabase
+      .from('bookings')
+      .select('id,service_id,barber_id,date_iso,time,status');
+    if (error) {
+      console.error('[Vienna Cuts] loadBusy:', error.message);
+      return [];
+    }
+    return (data as BusyRow[]).map(rowToAppt);
+  }
+  return loadLocal();
 }
 
 /* ── Availability engine ─────────────────────────────────────────────────── */
@@ -99,7 +184,7 @@ export interface SlotInfo {
 }
 
 /** Candidate slots for a barber (or 'any') + service on a date. Past days are closed. */
-export function getSlots(dateISO: string, serviceId: string, barberId: string | 'any'): SlotInfo[] {
+function computeSlots(all: Appointment[], dateISO: string, serviceId: string, barberId: string | 'any'): SlotInfo[] {
   const { dateISO: today, minutes: nowMin } = viennaNow();
   if (dateISO < today) return [];
 
@@ -116,13 +201,13 @@ export function getSlots(dateISO: string, serviceId: string, barberId: string | 
   const eligible = barbers.filter((b) => barberAvailableOnWeekday(b, weekday));
   if (eligible.length === 0) return [];
 
-  const all = loadAppointments().filter(
+  const day = all.filter(
     (a) => a.dateISO === dateISO && a.status !== 'canceled' && eligible.includes(a.barberId as string)
   );
 
   // For 'any': a slot is available if at least one eligible barber is free.
   const isFree = (b: string, startMin: number, endMin: number) =>
-    !all.some((a) => {
+    !day.some((a) => {
       if (a.barberId !== b) return false;
       const s = timeToMinutes(a.time);
       const e = s + getService(a.serviceId).duration;
@@ -138,6 +223,10 @@ export function getSlots(dateISO: string, serviceId: string, barberId: string | 
   return slots;
 }
 
+export async function getSlots(dateISO: string, serviceId: string, barberId: string | 'any'): Promise<SlotInfo[]> {
+  return computeSlots(await loadBusy(), dateISO, serviceId, barberId);
+}
+
 export interface NewAppointmentInput {
   serviceId: string;
   barberId: string | 'any';
@@ -151,28 +240,30 @@ export interface NewAppointmentInput {
 
 export type CreateResult =
   | { ok: true; appointment: Appointment }
-  | { ok: false; reason: 'conflict' | 'invalid_slot' | 'duplicate'; message: string };
+  | { ok: false; reason: 'conflict' | 'invalid_slot' | 'duplicate' | 'server'; message: string };
 
 /** Server-style validated create: re-checks slot fresh at write time. */
-export function createAppointment(input: NewAppointmentInput): CreateResult {
+export async function createAppointment(input: NewAppointmentInput): Promise<CreateResult> {
   const dur = getService(input.serviceId).duration;
   const start = timeToMinutes(input.time);
   const end = start + dur;
 
-  const list = loadAppointments();
+  const list = await loadBusy();
 
-  // Duplicate submission guard (same email + slot within 60s)
-  const dupe = list.find(
-    (a) =>
-      a.email.toLowerCase() === input.email.toLowerCase() &&
-      a.dateISO === input.dateISO &&
-      a.time === input.time &&
-      Date.now() - a.createdAt < 60_000
-  );
-  if (dupe) return { ok: false, reason: 'duplicate', message: 'duplicate' };
+  // Duplicate submission guard (demo mode only — anon cannot read emails in Supabase mode)
+  if (!supabase) {
+    const dupe = list.find(
+      (a) =>
+        a.email.toLowerCase() === input.email.toLowerCase() &&
+        a.dateISO === input.dateISO &&
+        a.time === input.time &&
+        Date.now() - a.createdAt < 60_000
+    );
+    if (dupe) return { ok: false, reason: 'duplicate', message: 'duplicate' };
+  }
 
   // Re-validate the slot against current state (conflict prevention)
-  const slot = getSlots(input.dateISO, input.serviceId, input.barberId).find((s) => s.time === input.time);
+  const slot = computeSlots(list, input.dateISO, input.serviceId, input.barberId).find((s) => s.time === input.time);
   if (!slot) return { ok: false, reason: 'invalid_slot', message: 'invalid_slot' };
   if (!slot.available) return { ok: false, reason: 'conflict', message: 'conflict' };
 
@@ -202,12 +293,27 @@ export function createAppointment(input: NewAppointmentInput): CreateResult {
     status: 'pending',
     createdAt: Date.now(),
   };
-  saveAppointments([appointment, ...list]);
+
+  if (supabase) {
+    const { error } = await supabase.from('bookings').insert(apptToRow(appointment));
+    if (error) {
+      console.error('[Vienna Cuts] createAppointment:', error.message);
+      return { ok: false, reason: 'server', message: error.message };
+    }
+    return { ok: true, appointment };
+  }
+
+  saveLocal([appointment, ...loadLocal()]);
   return { ok: true, appointment };
 }
 
-export function updateAppointmentStatus(id: string, status: ApptStatus): Appointment[] {
-  const list = loadAppointments().map((a) => (a.id === id ? { ...a, status } : a));
-  saveAppointments(list);
+export async function updateAppointmentStatus(id: string, status: ApptStatus): Promise<Appointment[]> {
+  if (supabase) {
+    const { error } = await supabase.from('bookings').update({ status }).eq('id', id);
+    if (error) console.error('[Vienna Cuts] updateAppointmentStatus:', error.message);
+    return loadAppointments();
+  }
+  const list = loadLocal().map((a) => (a.id === id ? { ...a, status } : a));
+  saveLocal(list);
   return list;
 }

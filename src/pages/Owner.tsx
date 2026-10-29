@@ -6,6 +6,7 @@ import {
 import { useApp } from '../lib/app-context';
 import { BARBERS, SERVICES, Appointment, ApptStatus, getService, getBarber, viennaNow, addDaysISO, timeToMinutes } from '../lib/data';
 import { loadAppointments, updateAppointmentStatus } from '../lib/store';
+import { supabase } from '../lib/supabase';
 import { StatusPill, Kicker } from '../components/Shared';
 import Logo from '../components/Logo';
 
@@ -15,11 +16,18 @@ const DEMO_PASSWORD = 'vienna2026';
 function useOwnerAuth() {
   const [authed, setAuthed] = useState<boolean | null>(null);
   useEffect(() => {
-    try {
-      setAuthed(sessionStorage.getItem(AUTH_KEY) === '1');
-    } catch {
-      setAuthed(false);
+    if (!supabase) {
+      try {
+        setAuthed(sessionStorage.getItem(AUTH_KEY) === '1');
+      } catch {
+        setAuthed(false);
+      }
+      return;
     }
+    // Supabase Auth: session check + live updates
+    supabase.auth.getSession().then(({ data }) => setAuthed(!!data.session));
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => setAuthed(!!session));
+    return () => sub.subscription.unsubscribe();
   }, []);
   return { authed, setAuthed };
 }
@@ -30,10 +38,12 @@ export default function Owner() {
   const [appointments, setAppointments] = useState<Appointment[]>([]);
 
   useEffect(() => {
-    if (authed) setAppointments(loadAppointments());
+    if (authed) loadAppointments().then(setAppointments);
   }, [authed]);
 
-  const refresh = () => setAppointments(loadAppointments());
+  const refresh = () => {
+    loadAppointments().then(setAppointments);
+  };
 
   if (authed === null) {
     return (
@@ -44,20 +54,36 @@ export default function Owner() {
   }
   if (!authed) return <OwnerLogin onSuccess={() => setAuthed(true)} />;
 
-  return <OwnerDashboard view={view} setView={setView} appointments={appointments} refresh={refresh} onLogout={() => { try { sessionStorage.removeItem(AUTH_KEY); } catch {} setAuthed(false); }} />;
+  return <OwnerDashboard view={view} setView={setView} appointments={appointments} refresh={refresh} onLogout={async () => {
+    if (supabase) await supabase.auth.signOut();
+    else { try { sessionStorage.removeItem(AUTH_KEY); } catch {} }
+    setAuthed(false);
+  }} />;
 }
 
 /* ════════ LOGIN ════════ */
 function OwnerLogin({ onSuccess }: { onSuccess: () => void }) {
   const { t, lang } = useApp();
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const submit = (e: React.FormEvent) => {
+  const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true);
     setError(null);
+    if (supabase) {
+      // Real auth: email + password checked server-side (Supabase Auth)
+      const { error: signErr } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
+      if (signErr) {
+        setError(t('admin.login.err'));
+        setBusy(false);
+      } else {
+        onSuccess();
+      }
+      return;
+    }
     window.setTimeout(() => {
       if (password === DEMO_PASSWORD) {
         try { sessionStorage.setItem(AUTH_KEY, '1'); } catch {}
@@ -78,7 +104,27 @@ function OwnerLogin({ onSuccess }: { onSuccess: () => void }) {
           <p className="mt-1 text-xs font-semibold uppercase tracking-[0.22em] text-taupe-2">{t('admin.login.sub')}</p>
 
           <form onSubmit={submit} className="mt-7">
-            <label htmlFor="owner-pw" className="mb-1.5 block text-[10px] font-bold uppercase tracking-[0.2em] text-taupe-2">{t('admin.login.label')}</label>
+            {supabase && (
+              <>
+                <label htmlFor="owner-email" className="mb-1.5 block text-[10px] font-bold uppercase tracking-[0.2em] text-taupe-2">{lang === 'de' ? 'E-Mail' : 'Email'}</label>
+                <div className="relative">
+                  <Lock size={17} className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-taupe-2" aria-hidden />
+                  <input
+                    id="owner-email"
+                    type="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    autoComplete="username"
+                    className="h-12 w-full rounded-xl border border-white/10 bg-ink py-2 pl-11 pr-4 text-sm text-ivory outline-none transition-colors placeholder:text-taupe focus:border-copper"
+                    placeholder="admin@example.com"
+                  />
+                </div>
+                <label htmlFor="owner-pw" className="mb-1.5 mt-4 block text-[10px] font-bold uppercase tracking-[0.2em] text-taupe-2">{lang === 'de' ? 'Passwort' : 'Password'}</label>
+              </>
+            )}
+            {!supabase && (
+              <label htmlFor="owner-pw" className="mb-1.5 block text-[10px] font-bold uppercase tracking-[0.2em] text-taupe-2">{t('admin.login.label')}</label>
+            )}
             <div className="relative">
               <Lock size={17} className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-taupe-2" aria-hidden />
               <input
@@ -95,16 +141,24 @@ function OwnerLogin({ onSuccess }: { onSuccess: () => void }) {
               />
             </div>
             {error && <p id="pw-err" role="alert" className="mt-2 text-[11px] font-medium text-red-400">{error}</p>}
-            <button type="submit" disabled={busy || !password} className="mt-4 flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-copper text-xs font-bold uppercase tracking-[0.2em] text-ink transition-all hover:bg-copper-2 disabled:opacity-50">
+            <button type="submit" disabled={busy || !password || (!!supabase && !email.trim())} className="mt-4 flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-copper text-xs font-bold uppercase tracking-[0.2em] text-ink transition-all hover:bg-copper-2 disabled:opacity-50">
               {busy ? <span className="h-4 w-4 animate-spin rounded-full border-2 border-ink/30 border-t-ink" aria-hidden /> : <Lock size={15} aria-hidden />}
               {t('admin.login.btn')}
             </button>
-            <p className="mt-3 text-center font-mono text-[11px] text-copper-2/80">{t('admin.login.hint')}</p>
+            <p className="mt-3 text-center font-mono text-[11px] text-copper-2/80">
+              {supabase
+                ? (lang === 'de' ? 'Anmeldung mit deinem Admin-Konto (Supabase Auth).' : 'Sign in with your admin account (Supabase Auth).')
+                : t('admin.login.hint')}
+            </p>
           </form>
 
           <div className="mt-6 flex items-start gap-2 rounded-xl border border-amber-400/25 bg-amber-400/8 p-3">
             <ShieldAlert size={15} className="mt-0.5 shrink-0 text-amber-300" aria-hidden />
-            <p className="text-[10px] leading-relaxed text-amber-200/85">{t('admin.login.secure')}</p>
+            <p className="text-[10px] leading-relaxed text-amber-200/85">
+              {supabase
+                ? (lang === 'de' ? 'Sicher: Das Login läuft über Supabase Auth (E-Mail + Passwort) und wird serverseitig geprüft.' : 'Secure: login runs through Supabase Auth (email + password) and is verified server-side.')
+                : t('admin.login.secure')}
+            </p>
           </div>
         </div>
       </div>
@@ -123,8 +177,8 @@ function OwnerDashboard({ view, setView, appointments, refresh, onLogout }: {
   const { t, lang, toast } = useApp();
   const { dateISO: todayISO } = viennaNow();
 
-  const act = (id: string, status: ApptStatus) => {
-    updateAppointmentStatus(id, status);
+  const act = async (id: string, status: ApptStatus) => {
+    await updateAppointmentStatus(id, status);
     refresh();
     toast(status === 'confirmed' ? t('toast.confirmed') : status === 'canceled' ? t('toast.canceled') : t('toast.completed'), 'success');
   };
