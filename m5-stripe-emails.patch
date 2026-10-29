@@ -1,0 +1,492 @@
+diff --git a/.env.example b/.env.example
+index e284d87..e595299 100644
+--- a/.env.example
++++ b/.env.example
+@@ -4,7 +4,14 @@ VITE_SUPABASE_URL=https://xxxxxxxxxxxx.supabase.co
+ # Publishable key (sb_publishable_...) — safe for the browser
+ VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_xxxxxxxxxxxx
+ 
+-# ── Stripe (M5 — später) ──────────────────────────────────────────────────
+-# STRIPE_SECRET_KEY=sk_test_...
+-# STRIPE_WEBHOOK_SECRET=whsec_...
+-# RESEND_API_KEY=re_...
++# ── Stripe (Settings → Developers → API keys) ─────────────────────────────
++# Secret key (sk_test_...) — SERVER ONLY, never in frontend code
++STRIPE_SECRET_KEY=sk_test_xxxxxxxxxxxx
++# Webhook signing secret (whsec_...) — from Developers → Webhooks
++STRIPE_WEBHOOK_SECRET=whsec_xxxxxxxxxxxx
++
++# ── Supabase server key (API Keys → Secret keys) — SERVER ONLY ────────────
++SUPABASE_SECRET_KEY=sb_secret_xxxxxxxxxxxx
++
++# ── Resend (E-Mails — https://resend.com → API Keys) ──────────────────────
++RESEND_API_KEY=re_xxxxxxxxxxxx
+diff --git a/api/create-checkout.ts b/api/create-checkout.ts
+new file mode 100644
+index 0000000..a357163
+--- /dev/null
++++ b/api/create-checkout.ts
+@@ -0,0 +1,93 @@
++/* ── Vercel Function: creates a Stripe Checkout Session for a booking. ──
++   POST body: { bookingId, amountCents, serviceLabel, customerEmail,
++                successUrl, cancelUrl, meta }
++   Returns:   { url } — redirect the browser there. ─────────────────────── */
++
++import Stripe from 'stripe';
++
++function badUrl(u: unknown): u is string {
++  return typeof u !== 'string' || !/^https?:\/\//.test(u);
++}
++
++export default async function handler(req: any, res: any) {
++  if (req.method !== 'POST') {
++    res.status(405).json({ error: 'method_not_allowed' });
++    return;
++  }
++
++  const secretKey = process.env.STRIPE_SECRET_KEY;
++  const supabaseUrl = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
++  const supabaseKey = process.env.SUPABASE_SECRET_KEY;
++
++  if (!secretKey) {
++    res.status(503).json({ error: 'payments_not_configured' });
++    return;
++  }
++
++  const {
++    bookingId,
++    amountCents,
++    serviceLabel,
++    customerEmail,
++    successUrl,
++    cancelUrl,
++    meta,
++  } = req.body ?? {};
++
++  if (!bookingId || !amountCents) {
++    res.status(400).json({ error: 'missing_params' });
++    return;
++  }
++
++  try {
++    const stripe = new Stripe(secretKey);
++
++    const session = await stripe.checkout.sessions.create({
++      mode: 'payment',
++      payment_method_types: ['card'],
++      line_items: [
++        {
++          price_data: {
++            currency: 'eur',
++            unit_amount: Math.round(Number(amountCents)),
++            product_data: {
++              name: `Vienna Cuts — ${serviceLabel ?? 'Termin'}`,
++              description: meta ? String(meta).slice(0, 120) : undefined,
++            },
++          },
++          quantity: 1,
++        },
++      ],
++      metadata: {
++        bookingId: String(bookingId),
++        serviceLabel: String(serviceLabel ?? ''),
++      },
++      customer_email: customerEmail || undefined,
++      success_url: badUrl(successUrl)
++        ? `${req.headers.origin ?? ''}/#/buchen?paid=1&ref=${encodeURIComponent(bookingId)}`
++        : successUrl,
++      cancel_url: badUrl(cancelUrl)
++        ? `${req.headers.origin ?? ''}/#/buchen?canceled=1`
++        : cancelUrl,
++    });
++
++    // Best-effort: store the Stripe session id on the booking row (admin key).
++    if (supabaseUrl && supabaseKey) {
++      await fetch(`${supabaseUrl}/rest/v1/bookings?id=eq.${encodeURIComponent(bookingId)}`, {
++        method: 'PATCH',
++        headers: {
++          apikey: supabaseKey,
++          Authorization: `Bearer ${supabaseKey}`,
++          'Content-Type': 'application/json',
++          Prefer: 'return=minimal',
++        },
++        body: JSON.stringify({ stripe_session_id: session.id }),
++      }).catch(() => undefined);
++    }
++
++    res.status(200).json({ url: session.url });
++  } catch (err: any) {
++    console.error('[create-checkout]', err?.message ?? err);
++    res.status(500).json({ error: 'stripe_error', detail: err?.message ?? 'unknown' });
++  }
++}
+diff --git a/api/stripe-webhook.ts b/api/stripe-webhook.ts
+new file mode 100644
+index 0000000..c954fa2
+--- /dev/null
++++ b/api/stripe-webhook.ts
+@@ -0,0 +1,150 @@
++/* ── Vercel Function: Stripe webhook. ──
++   Verifies the Stripe signature for `checkout.session.completed`,
++   then: booking.status = 'confirmed' + confirmation email via Resend. ──── */
++
++import Stripe from 'stripe';
++import type { IncomingMessage } from 'node:http';
++
++async function getRawBody(req: IncomingMessage): Promise<Buffer> {
++  const chunks: Buffer[] = [];
++  for await (const chunk of req) {
++    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
++  }
++  return Buffer.concat(chunks);
++}
++
++export default async function handler(req: any, res: any) {
++  if (req.method !== 'POST') {
++    res.status(405).json({ error: 'method_not_allowed' });
++    return;
++  }
++
++  const secretKey = process.env.STRIPE_SECRET_KEY;
++  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
++  if (!secretKey || !webhookSecret) {
++    res.status(503).json({ error: 'payments_not_configured' });
++    return;
++  }
++
++  const stripe = new Stripe(secretKey);
++  const signature = req.headers['stripe-signature'] as string | undefined;
++  if (!signature) {
++    res.status(400).json({ error: 'missing_signature' });
++    return;
++  }
++
++  let event: Stripe.Event;
++  try {
++    const raw = await getRawBody(req);
++    event = stripe.webhooks.constructEvent(raw, signature, webhookSecret);
++  } catch (err: any) {
++    console.error('[stripe-webhook] signature check failed:', err?.message ?? err);
++    res.status(400).json({ error: 'invalid_signature' });
++    return;
++  }
++
++  if (event.type === 'checkout.session.completed') {
++    const session = event.data.object as Stripe.Checkout.Session;
++    const bookingId = session.metadata?.bookingId;
++    const supabaseUrl = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
++    const supabaseKey = process.env.SUPABASE_SECRET_KEY;
++
++    if (bookingId && supabaseUrl && supabaseKey) {
++      // 1) Mark the booking as confirmed (admin key bypasses RLS).
++      let booking: any = null;
++      try {
++        const patch = await fetch(
++          `${supabaseUrl}/rest/v1/bookings?id=eq.${encodeURIComponent(bookingId)}`,
++          {
++            method: 'PATCH',
++            headers: {
++              apikey: supabaseKey,
++              Authorization: `Bearer ${supabaseKey}`,
++              'Content-Type': 'application/json',
++              Prefer: 'return=representation',
++            },
++            body: JSON.stringify({ status: 'confirmed', stripe_session_id: session.id }),
++          }
++        );
++        const rows = await patch.json().catch(() => []);
++        booking = Array.isArray(rows) ? rows[0] : null;
++      } catch (err: any) {
++        console.error('[stripe-webhook] booking update failed:', err?.message ?? err);
++      }
++
++      // 2) Confirmation email via Resend (optional — skipped when no key).
++      const resendKey = process.env.RESEND_API_KEY;
++      const to = session.customer_details?.email || booking?.email;
++      if (resendKey && to) {
++        try {
++          await fetch('https://api.resend.com/emails', {
++            method: 'POST',
++            headers: {
++              Authorization: `Bearer ${resendKey}`,
++              'Content-Type': 'application/json',
++            },
++            body: JSON.stringify({
++              from: 'Vienna Cuts <onboarding@resend.dev>',
++              to,
++              subject: 'Terminbestätigung — Vienna Cuts',
++              html: emailHtml(booking, session.metadata?.serviceLabel ?? 'Termin', session.amount_total),
++            }),
++          });
++        } catch (err: any) {
++          console.error('[stripe-webhook] email failed:', err?.message ?? err);
++        }
++      }
++    }
++  }
++
++  res.status(200).json({ received: true });
++}
++
++/* ── Email template (branded, German — matches the site) ──────────────── */
++function emailHtml(booking: any, serviceLabel: string, amountTotal: number | null): string {
++  const esc = (v: unknown) =>
++    String(v ?? '').replace(/[&<>"']/g, (c) =>
++      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string
++    );
++  const row = (label: string, value: string) => `
++      <tr>
++        <td style="padding:10px 0;border-bottom:1px solid #3a2c1c;color:#8a7a63;font-size:11px;letter-spacing:2px;text-transform:uppercase;">${label}</td>
++        <td style="padding:10px 0;border-bottom:1px solid #3a2c1c;color:#f3ead9;font-size:14px;text-align:right;font-weight:bold;">${value}</td>
++      </tr>`;
++
++  const price = amountTotal != null ? `€${(amountTotal / 100).toFixed(2)}` : '';
++
++  return `<!doctype html>
++<html>
++  <body style="margin:0;background:#14100c;padding:32px 16px;font-family:Georgia,'Times New Roman',serif;">
++    <div style="max-width:520px;margin:0 auto;background:#1c1611;border:1px solid #b98a52;border-radius:16px;overflow:hidden;">
++      <div style="background:#b98a52;padding:22px 28px;">
++        <h1 style="margin:0;color:#14100c;font-size:22px;letter-spacing:2px;">✂ VIENNA CUTS</h1>
++        <p style="margin:4px 0 0;color:#3a2c1c;font-size:10px;letter-spacing:4px;text-transform:uppercase;">Premium Barber Studio · Wien</p>
++      </div>
++      <div style="padding:28px;">
++        <h2 style="margin:0 0 8px;font-size:20px;color:#f3ead9;">Terminbestätigung</h2>
++        <p style="margin:0 0 22px;font-size:13px;line-height:1.7;color:#c9b99f;">
++          Hallo ${esc(booking?.name || '')}, dein Termin ist bestätigt und bezahlt.
++          Bitte sei 5 Minuten vor deinem Slot da.
++        </p>
++        <table style="width:100%;border-collapse:collapse;">
++          ${row('Service', esc(serviceLabel))}
++          ${row('Datum', esc(booking?.date_iso))}
++          ${row('Uhrzeit', esc(booking?.time))}
++          ${price ? row('Bezahlt', price) : ''}
++          ${row('Referenz', esc(booking?.id))}
++        </table>
++        <p style="margin:24px 0 0;font-size:13px;line-height:1.7;color:#c9b99f;">
++          Wir freuen uns auf dich!<br />— Dein Vienna-Cuts-Team
++        </p>
++      </div>
++      <div style="padding:16px 28px;border-top:1px solid #3a2c1c;">
++        <p style="margin:0;font-size:10px;color:#8a7a63;">
++          Vienna Cuts — Premium Barber Studio Wien · Automatische Nachricht, bitte nicht antworten.
++        </p>
++      </div>
++    </div>
++  </body>
++</html>`;
++}
+diff --git a/package.json b/package.json
+index 3f64e0f..2516d22 100644
+--- a/package.json
++++ b/package.json
+@@ -17,6 +17,7 @@
+     "react": "^19.2.0",
+     "react-dom": "^19.2.0",
+     "react-router-dom": "^7.13.1",
++    "stripe": "^23.0.1",
+     "tailwindcss": "^4.2.1"
+   },
+   "devDependencies": {
+diff --git a/src/lib/i18n.tsx b/src/lib/i18n.tsx
+index fa8f64f..c318db4 100644
+--- a/src/lib/i18n.tsx
++++ b/src/lib/i18n.tsx
+@@ -61,7 +61,7 @@ export const STRINGS: Record<Lang, Dict> = {
+     'contact.err.name': 'Bitte gib deinen Namen an.', 'contact.err.email': 'Bitte gib eine gültige E-Mail an.', 'contact.err.msg': 'Nachricht braucht mindestens 10 Zeichen.',
+     'contact.cta': 'Oder gleich einen Stuhl sichern',
+ 
+-    'book.kicker': 'Reservierung', 'book.title': 'Dein Stuhl wartet.', 'book.demo': 'Demo-Buchung (Browser-Speicherung, keine echten Termine)',
++    'book.kicker': 'Reservierung', 'book.title': 'Dein Stuhl wartet.', 'book.demo': 'Sichere Buchung — Zahlung per Karte, Bestätigung per E-Mail',
+     'book.step1': 'Leistung', 'book.step2': 'Barber', 'book.step3': 'Termin', 'book.step4': 'Details',
+     'book.s1.title': 'Was dürfen wir heute?', 'book.s1.sub': 'Wähle eine Leistung — Preise & Zeiten sind fix.',
+     'book.s2.title': 'Wer soll den Stuhl übernehmen?', 'book.s2.sub': 'Dein Liebling – oder einfach der, der frei ist.',
+@@ -79,11 +79,11 @@ export const STRINGS: Record<Lang, Dict> = {
+     'book.conflict': 'Diese Zeit wurde soeben vergeben. Bitte wähle einen anderen Slot.',
+     'book.duplicate': 'Dieser Termin wurde gerade eben schon erfasst.',
+     'book.invalid': 'Dieses Zeitslot ist nicht mehr gültig. Bitte wähle neu.',
+-    'book.done.title': 'Stuhl reserviert.', 'book.done.ref': 'Referenz', 'book.done.text': 'Dein Termin ist gespeichert — er erscheint sofort im Inhaber-Dashboard (Demo, lokal in diesem Browser). Wir bestätigen dir den Slot per E-Mail, sobald der Inhaber bestätigt.',
++    'book.done.title': 'Stuhl reserviert.', 'book.done.ref': 'Referenz', 'book.done.text': 'Dein Termin ist gespeichert und erscheint sofort im Inhaber-Dashboard. Du erhältst eine Bestätigung, sobald der Termin freigegeben ist.',
+     'book.done.again': 'Weiteren Termin buchen', 'book.done.overview': 'Zur Startseite',
+     'book.conflictTitle': 'Zeitkonflikt',
+ 
+-    'admin.login.title': 'Inhaber-Login', 'admin.login.sub': 'Geschützter Bereich · Demo-Prototyp',
++    'admin.login.title': 'Inhaber-Login', 'admin.login.sub': 'Geschützter Bereich',
+     'admin.login.label': 'Passwort (Demo)', 'admin.login.btn': 'Anmelden', 'admin.login.hint': 'Demo-Passwort: vienna2026 (nur lokal, nicht sicher — Prototyp)',
+     'admin.login.err': 'Falsches Passwort — bitte versuche es erneut.',
+     'admin.login.secure': 'Hinweis: Reiner Frontend-Prototyp ohne Server-Auth. Das Passwort ist nicht sicher gespeichert — “Sicherheit” hier ist eine UX-Geste, kein Schutz.',
+@@ -93,7 +93,7 @@ export const STRINGS: Record<Lang, Dict> = {
+     'admin.search': 'Suchen (Name, E-Mail, Referenz)…', 'admin.filter.status': 'Status', 'admin.filter.barber': 'Barber', 'admin.filter.date': 'Datum',
+     'admin.filter.all': 'Alle', 'admin.col.datetime': 'Datum & Zeit', 'admin.col.customer': 'Kunde', 'admin.col.service': 'Leistung', 'admin.col.barber': 'Barber', 'admin.col.status': 'Status', 'admin.col.actions': 'Aktionen',
+     'admin.confirm': 'Bestätigen', 'admin.complete': 'Abschließen', 'admin.cancel': 'Stornieren', 'admin.empty': 'Keine Termine gefunden — Filter zurücksetzen?',
+-    'admin.reset': 'Filter zurücksetzen', 'admin.demo.note': 'Demo-Daten (fiktiv). Änderungen werden nur lokal in diesem Browser gespeichert.',
++    'admin.reset': 'Filter zurücksetzen', 'admin.demo.note': 'Demo-Daten (fiktiv). Änderungen werden in der Datenbank gespeichert.',
+     'admin.week': 'Woche', 'admin.day': 'Tag', 'admin.prev': 'Zurück', 'admin.next': 'Weiter',
+     'admin.status.pending': 'Offen', 'admin.status.confirmed': 'Bestätigt', 'admin.status.completed': 'Erledigt', 'admin.status.canceled': 'Storniert',
+     'admin.todayList': 'Heutige Termine', 'admin.noToday': 'Heute keine Termine.',
+@@ -158,7 +158,7 @@ export const STRINGS: Record<Lang, Dict> = {
+     'contact.err.name': 'Please enter your name.', 'contact.err.email': 'Please enter a valid email.', 'contact.err.msg': 'Message needs at least 10 characters.',
+     'contact.cta': 'Or secure a chair right away',
+ 
+-    'book.kicker': 'Reservation', 'book.title': 'Your chair is waiting.', 'book.demo': 'Demo booking (stored in this browser — no real appointments)',
++    'book.kicker': 'Reservation', 'book.title': 'Your chair is waiting.', 'book.demo': 'Secure booking — pay by card, instant email confirmation',
+     'book.step1': 'Service', 'book.step2': 'Barber', 'book.step3': 'Time', 'book.step4': 'Details',
+     'book.s1.title': 'What can we do for you today?', 'book.s1.sub': 'Choose a service — prices & durations are fixed.',
+     'book.s2.title': 'Who should take the chair?', 'book.s2.sub': 'Your favourite — or simply whoever is free.',
+@@ -176,11 +176,11 @@ export const STRINGS: Record<Lang, Dict> = {
+     'book.conflict': 'That time was just taken. Please pick another slot.',
+     'book.duplicate': 'This appointment was already captured a moment ago.',
+     'book.invalid': 'This slot is no longer valid. Please choose again.',
+-    'book.done.title': 'Chair reserved.', 'book.done.ref': 'Reference', 'book.done.text': 'Your appointment is saved — it appears immediately in the owner dashboard (demo, stored locally in this browser). We’ll confirm the slot by email once the owner approves.',
++    'book.done.title': 'Chair reserved.', 'book.done.ref': 'Reference', 'book.done.text': 'Your appointment is saved and appears immediately in the owner dashboard. You’ll receive a confirmation once the slot is released.',
+     'book.done.again': 'Book another appointment', 'book.done.overview': 'Back to homepage',
+     'book.conflictTitle': 'Time conflict',
+ 
+-    'admin.login.title': 'Owner login', 'admin.login.sub': 'Protected area · demo prototype',
++    'admin.login.title': 'Owner login', 'admin.login.sub': 'Protected area',
+     'admin.login.label': 'Password (demo)', 'admin.login.btn': 'Sign in', 'admin.login.hint': 'Demo password: vienna2026 (local only, not secure — prototype)',
+     'admin.login.err': 'Wrong password — please try again.',
+     'admin.login.secure': 'Please note: front-end-only prototype without server auth. The password is not securely stored — “security” here is a UX gesture, not protection.',
+@@ -190,7 +190,7 @@ export const STRINGS: Record<Lang, Dict> = {
+     'admin.search': 'Search (name, email, reference)…', 'admin.filter.status': 'Status', 'admin.filter.barber': 'Barber', 'admin.filter.date': 'Date',
+     'admin.filter.all': 'All', 'admin.col.datetime': 'Date & time', 'admin.col.customer': 'Customer', 'admin.col.service': 'Service', 'admin.col.barber': 'Barber', 'admin.col.status': 'Status', 'admin.col.actions': 'Actions',
+     'admin.confirm': 'Confirm', 'admin.complete': 'Complete', 'admin.cancel': 'Cancel', 'admin.empty': 'No appointments found — reset filters?',
+-    'admin.reset': 'Reset filters', 'admin.demo.note': 'Demo data (fictional). Changes are stored locally in this browser only.',
++    'admin.reset': 'Reset filters', 'admin.demo.note': 'Demo data (fictional). Changes are saved to the database.',
+     'admin.week': 'Week', 'admin.day': 'Day', 'admin.prev': 'Back', 'admin.next': 'Forward',
+     'admin.status.pending': 'Pending', 'admin.status.confirmed': 'Confirmed', 'admin.status.completed': 'Completed', 'admin.status.canceled': 'Canceled',
+     'admin.todayList': 'Today’s appointments', 'admin.noToday': 'No appointments today.',
+diff --git a/src/pages/Booking.tsx b/src/pages/Booking.tsx
+index 2cea71c..396201d 100644
+--- a/src/pages/Booking.tsx
++++ b/src/pages/Booking.tsx
+@@ -41,6 +41,7 @@ export default function Booking() {
+   const [submitError, setSubmitError] = useState<string | null>(null);
+   const [saving, setSaving] = useState(false);
+   const [doneRef, setDoneRef] = useState<string | null>(null);
++  const [paid, setPaid] = useState(false);
+   const [viewMonth, setViewMonth] = useState(() => {
+     const { dateISO: today } = viennaNow();
+     const [y, m] = today.split('-').map(Number);
+@@ -74,6 +75,32 @@ export default function Booking() {
+     } catch { /* ignore */ }
+   }, [serviceId, barberId, dateISO, time, name, email, phone, note, doneRef]);
+ 
++  /* Return from Stripe Checkout: ?paid=1&ref=... (or ?canceled=1) */
++  useEffect(() => {
++    const params = new URLSearchParams(location.search);
++    if (params.get('paid') === '1') {
++      const s = params.get('service');
++      const b = params.get('barber');
++      const d = params.get('date');
++      const tm = params.get('time');
++      if (s) setServiceId(s);
++      if (b) setBarberId(b as string | 'any');
++      if (d) setDateISO(d);
++      if (tm) setTime(tm);
++      setPaid(true);
++      setDoneRef(params.get('ref') || 'VC-PAID');
++      toast(t('toast.saved'), 'success');
++    } else if (params.get('canceled') === '1') {
++      toast(
++        lang === 'de'
++          ? 'Zahlung abgebrochen — deine Buchung bleibt als „pending" offen.'
++          : 'Payment canceled — your booking remains "pending" for now.',
++        'info'
++      );
++    }
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, []);
++
+   const service = serviceId ? getService(serviceId) : null;
+   const barber = barberId ? getBarber(barberId) : null;
+ 
+@@ -142,13 +169,39 @@ export default function Booking() {
+     setSaving(true);
+     setSubmitError(null);
+     const result = await createAppointment({ serviceId, barberId, dateISO, time, name: name.trim(), email: email.trim(), phone: phone.trim(), note: note.trim() });
+-    setSaving(false);
+     if (result.ok) {
+-      setDoneRef(result.appointment.id);
+       try { sessionStorage.removeItem(DRAFT_KEY); } catch { /* ignore */ }
++      /* ── Payment: try Stripe Checkout (skipped when not configured) ── */
++      try {
++        const qs = new URLSearchParams({
++          paid: '1', ref: result.appointment.id,
++          service: serviceId, barber: barberId, date: dateISO, time,
++        }).toString();
++        const r = await fetch('/api/create-checkout', {
++          method: 'POST',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify({
++            bookingId: result.appointment.id,
++            amountCents: (service?.price ?? 0) * 100,
++            serviceLabel: service?.name[lang] ?? 'Termin',
++            customerEmail: email.trim(),
++            successUrl: `${window.location.origin}/#/buchen?${qs}`,
++            cancelUrl: `${window.location.origin}/#/buchen?canceled=1`,
++            meta: `${dateISO} ${time} · ${barberId === 'any' ? t('book.anyone') : barber?.name ?? ''}`,
++          }),
++        });
++        const data = await r.json();
++        if (data?.url) {
++          window.location.href = data.url; // → Stripe Checkout
++          return;
++        }
++      } catch { /* payments not configured — continue without payment */ }
++      setSaving(false);
++      setDoneRef(result.appointment.id);
+       toast(t('toast.saved'), 'success');
+       window.scrollTo({ top: 0, behavior: 'smooth' });
+     } else {
++      setSaving(false);
+       setSubmitError(result.reason === 'conflict' ? t('book.conflict') : result.reason === 'duplicate' ? t('book.duplicate') : t('book.invalid'));
+       if (result.reason === 'conflict') {
+         setTime(null);
+@@ -188,6 +241,11 @@ export default function Booking() {
+           <p className="mt-2 inline-flex items-center gap-2 rounded-full border border-copper/35 bg-copper/10 px-4 py-1.5 font-mono text-sm font-bold tracking-wider text-copper-2">
+             <BadgeCheck size={15} aria-hidden /> {t('book.done.ref')}: {doneRef}
+           </p>
++          {paid && (
++            <p className="mt-2 inline-flex items-center gap-2 rounded-full border border-emerald-400/35 bg-emerald-400/10 px-4 py-1.5 font-mono text-sm font-bold tracking-wider text-emerald-300">
++              <BadgeCheck size={15} aria-hidden /> {lang === 'de' ? 'Bezahlt · Bestätigt' : 'Paid · Confirmed'}
++            </p>
++          )}
+           <dl className="mt-6 grid grid-cols-2 gap-3 text-left text-sm">
+             {[
+               [t('book.step1'), service?.name[lang] + ` · €${service?.price}`],
+@@ -201,7 +259,13 @@ export default function Booking() {
+               </div>
+             ))}
+           </dl>
+-          <p className="mt-6 text-xs leading-relaxed text-ivory-3">{t('book.done.text')}</p>
++          <p className="mt-6 text-xs leading-relaxed text-ivory-3">
++            {paid
++              ? (lang === 'de'
++                  ? 'Dein Termin ist bezahlt und bestätigt. Eine Bestätigungs-E-Mail ist unterwegs an deine E-Mail-Adresse.'
++                  : 'Your appointment is paid and confirmed. A confirmation email is on its way to your inbox.')
++              : t('book.done.text')}
++          </p>
+           <div className="mt-7 flex flex-col gap-2 sm:flex-row sm:justify-center">
+             <button onClick={resetAll} className="h-11 rounded-xl border border-copper/50 px-6 text-xs font-bold uppercase tracking-widest text-copper-2 transition-colors hover:bg-copper hover:text-ink">
+               {t('book.done.again')}
+@@ -211,7 +275,7 @@ export default function Booking() {
+             </Link>
+           </div>
+           <button onClick={() => navigate('/inhaber')} className="mt-4 text-[10px] font-semibold uppercase tracking-[0.2em] text-taupe-2 underline-offset-4 hover:text-copper-2 hover:underline">
+-            {lang === 'de' ? 'Zum Inhaber-Dashboard (Demo)' : 'Open owner dashboard (demo)'}
++            {lang === 'de' ? 'Zum Inhaber-Dashboard' : 'Open owner dashboard'}
+           </button>
+         </div>
+       </div>
+@@ -537,8 +601,8 @@ export default function Booking() {
+             <p className="mt-4 flex items-start gap-1.5 text-[9px] leading-relaxed text-taupe">
+               <Info size={11} className="mt-0.5 shrink-0" aria-hidden />
+               {lang === 'de'
+-                ? 'Demo: Reservierung wird nur in diesem Browser gespeichert (localStorage). Konfliktprüfung läuft lokal in Echtzeit — es werden keine echten Termine vergeben.'
+-                : 'Demo: your reservation is stored only in this browser (localStorage). Conflict checks run locally in real time — no real appointments are made.'}
++                ? 'Deine Reservierung wird sicher in unserer Datenbank gespeichert. Nach erfolgreicher Zahlung ist dein Slot sofort bestätigt — inklusive Bestätigungs-E-Mail.'
++                : 'Your reservation is saved securely in our database. Once payment succeeds your slot is confirmed instantly — including a confirmation email.'}
+             </p>
+             {step === 4 && (
+               <button onClick={submit} disabled={saving} className="mt-4 flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-copper text-xs font-bold uppercase tracking-widest text-ink shadow-[0_10px_34px_-10px] shadow-copper/60 transition-all hover:bg-copper-2 lg:hidden">

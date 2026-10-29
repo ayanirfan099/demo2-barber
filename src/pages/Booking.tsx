@@ -41,6 +41,7 @@ export default function Booking() {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [doneRef, setDoneRef] = useState<string | null>(null);
+  const [paid, setPaid] = useState(false);
   const [viewMonth, setViewMonth] = useState(() => {
     const { dateISO: today } = viennaNow();
     const [y, m] = today.split('-').map(Number);
@@ -73,6 +74,32 @@ export default function Booking() {
       sessionStorage.setItem(DRAFT_KEY, JSON.stringify({ serviceId, barberId, dateISO, time, name, email, phone, note }));
     } catch { /* ignore */ }
   }, [serviceId, barberId, dateISO, time, name, email, phone, note, doneRef]);
+
+  /* Return from Stripe Checkout: ?paid=1&ref=... (or ?canceled=1) */
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    if (params.get('paid') === '1') {
+      const s = params.get('service');
+      const b = params.get('barber');
+      const d = params.get('date');
+      const tm = params.get('time');
+      if (s) setServiceId(s);
+      if (b) setBarberId(b as string | 'any');
+      if (d) setDateISO(d);
+      if (tm) setTime(tm);
+      setPaid(true);
+      setDoneRef(params.get('ref') || 'VC-PAID');
+      toast(t('toast.saved'), 'success');
+    } else if (params.get('canceled') === '1') {
+      toast(
+        lang === 'de'
+          ? 'Zahlung abgebrochen — deine Buchung bleibt als „pending" offen.'
+          : 'Payment canceled — your booking remains "pending" for now.',
+        'info'
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const service = serviceId ? getService(serviceId) : null;
   const barber = barberId ? getBarber(barberId) : null;
@@ -142,13 +169,39 @@ export default function Booking() {
     setSaving(true);
     setSubmitError(null);
     const result = await createAppointment({ serviceId, barberId, dateISO, time, name: name.trim(), email: email.trim(), phone: phone.trim(), note: note.trim() });
-    setSaving(false);
     if (result.ok) {
-      setDoneRef(result.appointment.id);
       try { sessionStorage.removeItem(DRAFT_KEY); } catch { /* ignore */ }
+      /* ── Payment: try Stripe Checkout (skipped when not configured) ── */
+      try {
+        const qs = new URLSearchParams({
+          paid: '1', ref: result.appointment.id,
+          service: serviceId, barber: barberId, date: dateISO, time,
+        }).toString();
+        const r = await fetch('/api/create-checkout', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            bookingId: result.appointment.id,
+            amountCents: (service?.price ?? 0) * 100,
+            serviceLabel: service?.name[lang] ?? 'Termin',
+            customerEmail: email.trim(),
+            successUrl: `${window.location.origin}/#/buchen?${qs}`,
+            cancelUrl: `${window.location.origin}/#/buchen?canceled=1`,
+            meta: `${dateISO} ${time} · ${barberId === 'any' ? t('book.anyone') : barber?.name ?? ''}`,
+          }),
+        });
+        const data = await r.json();
+        if (data?.url) {
+          window.location.href = data.url; // → Stripe Checkout
+          return;
+        }
+      } catch { /* payments not configured — continue without payment */ }
+      setSaving(false);
+      setDoneRef(result.appointment.id);
       toast(t('toast.saved'), 'success');
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } else {
+      setSaving(false);
       setSubmitError(result.reason === 'conflict' ? t('book.conflict') : result.reason === 'duplicate' ? t('book.duplicate') : t('book.invalid'));
       if (result.reason === 'conflict') {
         setTime(null);
@@ -188,6 +241,11 @@ export default function Booking() {
           <p className="mt-2 inline-flex items-center gap-2 rounded-full border border-copper/35 bg-copper/10 px-4 py-1.5 font-mono text-sm font-bold tracking-wider text-copper-2">
             <BadgeCheck size={15} aria-hidden /> {t('book.done.ref')}: {doneRef}
           </p>
+          {paid && (
+            <p className="mt-2 inline-flex items-center gap-2 rounded-full border border-emerald-400/35 bg-emerald-400/10 px-4 py-1.5 font-mono text-sm font-bold tracking-wider text-emerald-300">
+              <BadgeCheck size={15} aria-hidden /> {lang === 'de' ? 'Bezahlt · Bestätigt' : 'Paid · Confirmed'}
+            </p>
+          )}
           <dl className="mt-6 grid grid-cols-2 gap-3 text-left text-sm">
             {[
               [t('book.step1'), service?.name[lang] + ` · €${service?.price}`],
@@ -201,7 +259,13 @@ export default function Booking() {
               </div>
             ))}
           </dl>
-          <p className="mt-6 text-xs leading-relaxed text-ivory-3">{t('book.done.text')}</p>
+          <p className="mt-6 text-xs leading-relaxed text-ivory-3">
+            {paid
+              ? (lang === 'de'
+                  ? 'Dein Termin ist bezahlt und bestätigt. Eine Bestätigungs-E-Mail ist unterwegs an deine E-Mail-Adresse.'
+                  : 'Your appointment is paid and confirmed. A confirmation email is on its way to your inbox.')
+              : t('book.done.text')}
+          </p>
           <div className="mt-7 flex flex-col gap-2 sm:flex-row sm:justify-center">
             <button onClick={resetAll} className="h-11 rounded-xl border border-copper/50 px-6 text-xs font-bold uppercase tracking-widest text-copper-2 transition-colors hover:bg-copper hover:text-ink">
               {t('book.done.again')}
@@ -211,7 +275,7 @@ export default function Booking() {
             </Link>
           </div>
           <button onClick={() => navigate('/inhaber')} className="mt-4 text-[10px] font-semibold uppercase tracking-[0.2em] text-taupe-2 underline-offset-4 hover:text-copper-2 hover:underline">
-            {lang === 'de' ? 'Zum Inhaber-Dashboard (Demo)' : 'Open owner dashboard (demo)'}
+            {lang === 'de' ? 'Zum Inhaber-Dashboard' : 'Open owner dashboard'}
           </button>
         </div>
       </div>
@@ -537,8 +601,8 @@ export default function Booking() {
             <p className="mt-4 flex items-start gap-1.5 text-[9px] leading-relaxed text-taupe">
               <Info size={11} className="mt-0.5 shrink-0" aria-hidden />
               {lang === 'de'
-                ? 'Demo: Reservierung wird nur in diesem Browser gespeichert (localStorage). Konfliktprüfung läuft lokal in Echtzeit — es werden keine echten Termine vergeben.'
-                : 'Demo: your reservation is stored only in this browser (localStorage). Conflict checks run locally in real time — no real appointments are made.'}
+                ? 'Deine Reservierung wird sicher in unserer Datenbank gespeichert. Nach erfolgreicher Zahlung ist dein Slot sofort bestätigt — inklusive Bestätigungs-E-Mail.'
+                : 'Your reservation is saved securely in our database. Once payment succeeds your slot is confirmed instantly — including a confirmation email.'}
             </p>
             {step === 4 && (
               <button onClick={submit} disabled={saving} className="mt-4 flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-copper text-xs font-bold uppercase tracking-widest text-ink shadow-[0_10px_34px_-10px] shadow-copper/60 transition-all hover:bg-copper-2 lg:hidden">
