@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import {
   Lock, LogOut, LayoutDashboard, CalendarDays, Table2, Search, Check, X, CheckCheck,
   ChevronLeft, ChevronRight, Users, Euro, CalendarClock, Inbox, Trash2, ShieldAlert,
@@ -174,7 +175,14 @@ function OwnerLogin({ onSuccess }: { onSuccess: () => void }) {
   return (
     <div className="dot-grid flex min-h-[100svh] items-center justify-center bg-ink px-4">
       <div className="w-full max-w-md">
-        <div className="rounded-3xl border border-copper/25 bg-gradient-to-b from-ink-2 to-ink-3 p-8 shadow-card sm:p-10">
+        <div className="relative rounded-3xl border border-copper/25 bg-gradient-to-b from-ink-2 to-ink-3 p-8 shadow-card sm:p-10">
+          <Link
+            to="/"
+            className="absolute right-5 top-5 flex items-center gap-1 rounded-lg border border-white/10 px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] text-taupe-2 transition-colors hover:border-copper hover:text-copper-2"
+          >
+            <ChevronLeft size={12} aria-hidden />
+            {lang === 'de' ? 'Zurück zur Startseite' : 'Back to homepage'}
+          </Link>
           <Logo size={52} />
           <h1 className="mt-5 font-display text-3xl font-black text-ivory">{t('admin.login.title')}</h1>
           <p className="mt-1 text-xs font-semibold uppercase tracking-[0.22em] text-taupe-2">{t('admin.login.sub')}</p>
