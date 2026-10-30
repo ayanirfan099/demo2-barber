@@ -123,7 +123,7 @@ export default function Owner() {
 
   if (authed === null) {
     return (
-      <div className="flex min-h-[100svh] items-center justify-center bg-ink pt-24">
+      <div className="flex min-h-[100svh] items-center justify-center bg-ink">
         <div className="h-8 w-8 animate-spin rounded-full border-2 border-copper/30 border-t-copper" aria-hidden />
       </div>
     );
@@ -172,7 +172,7 @@ function OwnerLogin({ onSuccess }: { onSuccess: () => void }) {
   };
 
   return (
-    <div className="dot-grid flex min-h-[100svh] items-center justify-center bg-ink px-4 pt-24">
+    <div className="dot-grid flex min-h-[100svh] items-center justify-center bg-ink px-4">
       <div className="w-full max-w-md">
         <div className="rounded-3xl border border-copper/25 bg-gradient-to-b from-ink-2 to-ink-3 p-8 shadow-card sm:p-10">
           <Logo size={52} />
@@ -266,7 +266,7 @@ function OwnerDashboard({ view, setView, appointments, refresh, onLogout }: {
   ];
 
   return (
-    <div className="min-h-[100svh] bg-ink pt-[4.6rem] sm:pt-20">
+    <div className="min-h-[100svh] bg-ink">
       {/* Sub-header */}
       <div className="sticky top-[4.6rem] z-30 border-b border-copper/15 bg-ink/95 backdrop-blur-xl sm:top-20">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-2 px-4 py-2.5 sm:px-6 lg:px-8">
