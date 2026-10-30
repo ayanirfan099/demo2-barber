@@ -80,7 +80,7 @@ export default async function handler(req: any, res: any) {
           'Content-Type': 'application/json',
           Prefer: 'return=minimal',
         },
-        body: JSON.stringify({ stripe_session_id: session.id }),
+        body: JSON.stringify({ stripe_session_id: session.id, payment_method: 'online' }),
       }).catch(() => undefined);
     }
 

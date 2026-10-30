@@ -3,11 +3,11 @@ import { useLocation, useNavigate, Link } from 'react-router-dom';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
   Check, ChevronLeft, ChevronRight, Clock, CalendarCheck, Scissors, User, Users,
-  AlertCircle, CheckCircle2, Loader2, BadgeCheck, Sparkles, Info,
+  AlertCircle, CheckCircle2, Loader2, BadgeCheck, Sparkles, Info, CreditCard, Wallet,
 } from 'lucide-react';
 import { useApp } from '../lib/app-context';
 import { SERVICES, BARBERS, getService, getBarber, HOURS, viennaNow, addDaysISO } from '../lib/data';
-import { createAppointment, getSlots, type SlotInfo } from '../lib/store';
+import { createAppointment, getSlots, setPaymentMethod, type SlotInfo } from '../lib/store';
 import { Kicker } from '../components/Shared';
 import Logo from '../components/Logo';
 
@@ -42,6 +42,8 @@ export default function Booking() {
   const [saving, setSaving] = useState(false);
   const [doneRef, setDoneRef] = useState<string | null>(null);
   const [paid, setPaid] = useState(false);
+  const [payChoice, setPayChoice] = useState<string | null>(null); // booking saved → customer picks payment method
+  const [payMode, setPayMode] = useState<'online' | 'in_person' | null>(null);
   const [viewMonth, setViewMonth] = useState(() => {
     const { dateISO: today } = viennaNow();
     const [y, m] = today.split('-').map(Number);
@@ -88,13 +90,16 @@ export default function Booking() {
       if (d) setDateISO(d);
       if (tm) setTime(tm);
       setPaid(true);
+      setPayMode('online');
       setDoneRef(params.get('ref') || 'VC-PAID');
       toast(t('toast.saved'), 'success');
     } else if (params.get('canceled') === '1') {
+      const ref = params.get('ref');
+      if (ref) setPayChoice(ref); // back to the payment-choice screen
       toast(
         lang === 'de'
-          ? 'Zahlung abgebrochen — deine Buchung bleibt als „pending" offen.'
-          : 'Payment canceled — your booking remains "pending" for now.',
+          ? 'Zahlung abgebrochen — wähle eine andere Zahlungsart.'
+          : 'Payment canceled — choose a different payment method.',
         'info'
       );
     }
@@ -171,33 +176,9 @@ export default function Booking() {
     const result = await createAppointment({ serviceId, barberId, dateISO, time, name: name.trim(), email: email.trim(), phone: phone.trim(), note: note.trim() });
     if (result.ok) {
       try { sessionStorage.removeItem(DRAFT_KEY); } catch { /* ignore */ }
-      /* ── Payment: try Stripe Checkout (skipped when not configured) ── */
-      try {
-        const qs = new URLSearchParams({
-          paid: '1', ref: result.appointment.id,
-          service: serviceId, barber: barberId, date: dateISO, time,
-        }).toString();
-        const r = await fetch('/api/create-checkout', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            bookingId: result.appointment.id,
-            amountCents: (service?.price ?? 0) * 100,
-            serviceLabel: service?.name[lang] ?? 'Termin',
-            customerEmail: email.trim(),
-            successUrl: `${window.location.origin}/#/buchen?${qs}`,
-            cancelUrl: `${window.location.origin}/#/buchen?canceled=1`,
-            meta: `${dateISO} ${time} · ${barberId === 'any' ? t('book.anyone') : barber?.name ?? ''}`,
-          }),
-        });
-        const data = await r.json();
-        if (data?.url) {
-          window.location.href = data.url; // → Stripe Checkout
-          return;
-        }
-      } catch { /* payments not configured — continue without payment */ }
       setSaving(false);
-      setDoneRef(result.appointment.id);
+      /* Booking saved — customer now picks how to pay (no forced redirect) */
+      setPayChoice(result.appointment.id);
       toast(t('toast.saved'), 'success');
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } else {
@@ -210,8 +191,56 @@ export default function Booking() {
     }
   };
 
+  /* ── Payment: customer chose "card" → Stripe Checkout ── */
+  const payOnline = async () => {
+    if (!payChoice || !serviceId || !barberId || !dateISO || !time) return;
+    setSaving(true);
+    try {
+      const qs = new URLSearchParams({
+        paid: '1', ref: payChoice,
+        service: serviceId, barber: barberId, date: dateISO, time,
+      }).toString();
+      const r = await fetch('/api/create-checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          bookingId: payChoice,
+          amountCents: (service?.price ?? 0) * 100,
+          serviceLabel: service?.name[lang] ?? 'Termin',
+          customerEmail: email.trim(),
+          successUrl: `${window.location.origin}/#/buchen?${qs}`,
+          cancelUrl: `${window.location.origin}/#/buchen?canceled=1&ref=${encodeURIComponent(payChoice)}`,
+          meta: `${dateISO} ${time} · ${barberId === 'any' ? t('book.anyone') : barber?.name ?? ''}`,
+        }),
+      });
+      const data = await r.json();
+      if (data?.url) {
+        setPaymentMethod(payChoice, 'online').catch(() => undefined);
+        window.location.href = data.url; // → Stripe Checkout
+        return;
+      }
+      toast(lang === 'de' ? 'Online-Zahlung derzeit nicht verfügbar — bitte im Salon zahlen.' : 'Online payment unavailable right now — please pay at the salon.', 'error');
+    } catch {
+      toast(lang === 'de' ? 'Online-Zahlung derzeit nicht verfügbar — bitte im Salon zahlen.' : 'Online payment unavailable right now — please pay at the salon.', 'error');
+    }
+    setSaving(false);
+  };
+
+  /* ── Payment: customer chose "pay at the salon" ── */
+  const payInPerson = () => {
+    if (!payChoice) return;
+    setPaymentMethod(payChoice, 'in_person').catch(() => undefined);
+    setPayMode('in_person');
+    setDoneRef(payChoice);
+    setPayChoice(null);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
   const resetAll = () => {
     setDoneRef(null);
+    setPayChoice(null);
+    setPayMode(null);
+    setPaid(false);
     setServiceId(null);
     setBarberId(null);
     setDateISO(null);
@@ -229,6 +258,52 @@ export default function Booking() {
   const inputCls = (invalid?: string) =>
     `h-11 w-full rounded-xl border bg-ink-3 px-4 text-sm text-ivory placeholder:text-taupe outline-none transition-colors focus:border-copper ${invalid ? 'border-red-400/60' : 'border-white/10'}`;
 
+  /* ════════ PAYMENT CHOICE — customer decides, no forced redirect ════════ */
+  if (payChoice) {
+    return (
+      <div className="flex min-h-[90svh] items-center justify-center bg-ink px-5 pt-24 sm:pt-28">
+        <div className="animate-fade-up w-full max-w-lg rounded-3xl border border-copper/30 bg-gradient-to-b from-ink-2 to-ink-3 p-8 text-center shadow-card sm:p-12">
+          <motion.div initial={{ scale: 0.6, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={{ type: 'spring', stiffness: 180, damping: 16 }}>
+            <CalendarCheck size={64} className="mx-auto text-copper-2" aria-hidden />
+          </motion.div>
+          <h1 className="mt-6 font-display text-3xl font-black text-ivory">
+            {lang === 'de' ? 'Termin gespeichert!' : 'Appointment saved!'}
+          </h1>
+          <p className="mt-2 inline-flex items-center gap-2 rounded-full border border-copper/35 bg-copper/10 px-4 py-1.5 font-mono text-sm font-bold tracking-wider text-copper-2">
+            <BadgeCheck size={15} aria-hidden /> {t('book.done.ref')}: {payChoice}
+          </p>
+          <p className="mt-5 text-sm text-ivory-3">
+            {lang === 'de' ? 'Wie möchtest du zahlen?' : 'How would you like to pay?'}
+          </p>
+          <div className="mt-6 flex flex-col gap-3">
+            <button
+              onClick={payOnline}
+              disabled={saving}
+              className="flex items-center justify-center gap-3 rounded-xl bg-copper px-6 py-4 text-sm font-bold uppercase tracking-[0.15em] text-ink transition-all hover:bg-copper-2 disabled:opacity-50"
+            >
+              {saving ? <Loader2 size={18} className="animate-spin" aria-hidden /> : <CreditCard size={18} aria-hidden />}
+              {lang === 'de' ? 'Online zahlen (Karte)' : 'Pay online (card)'}
+              <span className="ml-1 font-mono text-base">€{service?.price}</span>
+            </button>
+            <button
+              onClick={payInPerson}
+              disabled={saving}
+              className="flex items-center justify-center gap-3 rounded-xl border border-copper/50 px-6 py-4 text-sm font-bold uppercase tracking-[0.15em] text-copper-2 transition-colors hover:bg-copper hover:text-ink disabled:opacity-50"
+            >
+              <Wallet size={18} aria-hidden />
+              {lang === 'de' ? 'Im Salon zahlen (bar oder Karte)' : 'Pay at the salon (cash or card)'}
+            </button>
+          </div>
+          <p className="mt-6 text-xs leading-relaxed text-ivory-3">
+            {lang === 'de'
+              ? 'Dein Slot ist bereits reserviert — die Zahlungsart ist frei wählbar. Online-Zahlung bestätigt den Termin sofort.'
+              : 'Your slot is already reserved — the payment method is your choice. Paying online confirms your appointment instantly.'}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   /* ════════ CONFIRMATION SCREEN ════════ */
   if (doneRef) {
     return (
@@ -244,6 +319,11 @@ export default function Booking() {
           {paid && (
             <p className="mt-2 inline-flex items-center gap-2 rounded-full border border-emerald-400/35 bg-emerald-400/10 px-4 py-1.5 font-mono text-sm font-bold tracking-wider text-emerald-300">
               <BadgeCheck size={15} aria-hidden /> {lang === 'de' ? 'Bezahlt · Bestätigt' : 'Paid · Confirmed'}
+            </p>
+          )}
+          {!paid && payMode === 'in_person' && (
+            <p className="mt-2 inline-flex items-center gap-2 rounded-full border border-amber-400/35 bg-amber-400/10 px-4 py-1.5 font-mono text-sm font-bold tracking-wider text-amber-200">
+              <BadgeCheck size={15} aria-hidden /> {lang === 'de' ? 'Zahlung vor Ort im Salon' : 'Pay at the salon'}
             </p>
           )}
           <dl className="mt-6 grid grid-cols-2 gap-3 text-left text-sm">
@@ -264,7 +344,11 @@ export default function Booking() {
               ? (lang === 'de'
                   ? 'Dein Termin ist bezahlt und bestätigt. Eine Bestätigungs-E-Mail ist unterwegs an deine E-Mail-Adresse.'
                   : 'Your appointment is paid and confirmed. A confirmation email is on its way to your inbox.')
-              : t('book.done.text')}
+              : payMode === 'in_person'
+                ? (lang === 'de'
+                    ? 'Dein Termin ist gespeichert. Bitte zahle bei deinem Besuch im Salon — bar oder mit Karte. Wir freuen uns auf dich!'
+                    : 'Your appointment is saved. Please pay at the salon when you arrive — cash or card. See you soon!')
+                : t('book.done.text')}
           </p>
           <div className="mt-7 flex flex-col gap-2 sm:flex-row sm:justify-center">
             <button onClick={resetAll} className="h-11 rounded-xl border border-copper/50 px-6 text-xs font-bold uppercase tracking-widest text-copper-2 transition-colors hover:bg-copper hover:text-ink">

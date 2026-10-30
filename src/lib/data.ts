@@ -183,6 +183,7 @@ export interface Appointment {
   status: ApptStatus;
   createdAt: number;
   demoSeed?: boolean;
+  paymentMethod?: 'online' | 'in_person';
 }
 
 export const getService = (id: string) => SERVICES.find((s) => s.id === id)!;

@@ -34,6 +34,7 @@ interface BookingRow extends BusyRow {
   phone: string | null;
   note: string | null;
   created_at_ms: number | null;
+  payment_method: string | null;
 }
 
 const rowToAppt = (r: Partial<BookingRow> & BusyRow): Appointment => ({
@@ -48,6 +49,7 @@ const rowToAppt = (r: Partial<BookingRow> & BusyRow): Appointment => ({
   note: r.note ?? '',
   status: r.status,
   createdAt: Number(r.created_at_ms) || 0,
+  paymentMethod: (r.payment_method as Appointment['paymentMethod']) ?? undefined,
 });
 
 const apptToRow = (a: Appointment) => ({
@@ -62,6 +64,7 @@ const apptToRow = (a: Appointment) => ({
   note: a.note,
   status: a.status,
   created_at_ms: a.createdAt,
+  payment_method: a.paymentMethod ?? null,
 });
 
 /* ── Deterministic seed for the localStorage demo mode ───────────────────── */
@@ -236,6 +239,7 @@ export interface NewAppointmentInput {
   email: string;
   phone: string;
   note: string;
+  paymentMethod?: 'online' | 'in_person';
 }
 
 export type CreateResult =
@@ -316,4 +320,15 @@ export async function updateAppointmentStatus(id: string, status: ApptStatus): P
   const list = loadLocal().map((a) => (a.id === id ? { ...a, status } : a));
   saveLocal(list);
   return list;
+}
+
+/** Record the chosen payment method (anon may only update this one column). */
+export async function setPaymentMethod(id: string, method: 'online' | 'in_person'): Promise<void> {
+  if (supabase) {
+    const { error } = await supabase.from('bookings').update({ payment_method: method }).eq('id', id);
+    if (error) console.error('[Vienna Cuts] setPaymentMethod:', error.message);
+    return;
+  }
+  const list = loadLocal().map((a) => (a.id === id ? { ...a, paymentMethod: method } : a));
+  saveLocal(list);
 }
