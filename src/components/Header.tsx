@@ -108,7 +108,7 @@ export default function Header() {
 
           {/* Booking CTA */}
           <button
-            onClick={() => navigate('/buchen')}
+            onClick={() => navigate('/start')}
             className="flex h-9 items-center gap-1.5 rounded-lg bg-copper px-2.5 text-[11px] font-bold uppercase tracking-wide text-ink shadow-[0_8px_24px_-8px] shadow-copper/50 transition-all hover:bg-copper-2 active:scale-95 sm:gap-2 sm:px-4 sm:text-xs"
           >
             <CalendarCheck size={14} aria-hidden />

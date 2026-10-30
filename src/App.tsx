@@ -14,6 +14,8 @@ import Owner from './pages/Owner';
 import Legal from './pages/Legal';
 
 const OwnerLazy = lazy(() => Promise.resolve({ default: Owner }));
+const ChooseBooking = lazy(() => import('./pages/ChooseBooking'));
+const AiBooking = lazy(() => import('./pages/AiBooking'));
 
 function ScrollAndTitle() {
   const { pathname } = useLocation();
@@ -40,7 +42,9 @@ function Shell() {
             <Route path="/galerie" element={<Gallery />} />
             <Route path="/studio" element={<About />} />
             <Route path="/kontakt" element={<Contact />} />
-            <Route path="/buchen" element={<Booking />} />
+              <Route path="/buchen" element={<Booking />} />
+              <Route path="/start" element={<ChooseBooking />} />
+              <Route path="/ai" element={<AiBooking />} />
             <Route path="/inhaber" element={<OwnerLazy />} />
             <Route path="/impressum" element={<Legal kind="imprint" />} />
             <Route path="/datenschutz" element={<Legal kind="privacy" />} />
