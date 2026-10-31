@@ -47,7 +47,7 @@ export default function Home() {
             <p className="mt-5 max-w-md text-sm leading-relaxed text-ivory-2/95 sm:text-base">{t('home.sub')}</p>
             <div className="mt-7 flex flex-wrap items-center gap-3">
               <button
-                onClick={() => navigate('/start')}
+                onClick={() => navigate('/buchen')}
                 className="flex h-12 items-center gap-2 rounded-xl bg-copper px-6 text-sm font-bold uppercase tracking-wide text-ink shadow-[0_14px_40px_-10px] shadow-copper/60 transition-all hover:scale-[1.03] hover:bg-copper-2 active:scale-95"
               >
                 <CalendarCheck size={17} aria-hidden /> {t('home.cta')}
@@ -97,7 +97,7 @@ export default function Home() {
             {featured.map((s) => (
               <button
                 key={s.id}
-                onClick={() => navigate('/start', { state: { serviceId: s.id } })}
+                onClick={() => navigate('/buchen', { state: { serviceId: s.id } })}
                 className="lift group relative overflow-hidden rounded-2xl border border-white/8 bg-ink-2 text-left shadow-soft transition-colors hover:border-copper/45 focus-visible:border-copper"
               >
                 <div className="relative h-36 overflow-hidden sm:h-40">
@@ -231,7 +231,7 @@ export default function Home() {
           <h2 className="mt-5 font-display text-4xl font-black leading-[1.02] tracking-tight text-ivory sm:text-6xl">{t('home.cta.title')}</h2>
           <p className="mx-auto mt-4 max-w-md text-sm text-ivory-2/90 sm:text-base">{t('home.cta.text')}</p>
           <button
-            onClick={() => navigate('/start')}
+            onClick={() => navigate('/buchen')}
             className="mt-8 inline-flex h-13 items-center gap-2.5 rounded-xl bg-copper px-8 py-4 text-sm font-bold uppercase tracking-widest text-ink shadow-[0_18px_50px_-12px] shadow-copper/70 transition-all hover:scale-[1.04] hover:bg-copper-2 active:scale-95"
           >
             <CalendarCheck size={18} aria-hidden /> {t('home.cta.btn')}

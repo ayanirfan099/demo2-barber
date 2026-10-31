@@ -64,7 +64,7 @@ export default function Services() {
                 </ul>
 
                 <button
-                  onClick={() => navigate('/start', { state: { serviceId: s.id } })}
+                  onClick={() => navigate('/buchen', { state: { serviceId: s.id } })}
                   className="mt-5 flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-copper text-xs font-bold uppercase tracking-[0.18em] text-ink transition-all hover:bg-copper-2 active:scale-[0.98]"
                 >
                   <CalendarCheck size={15} aria-hidden /> {t('services.book')} · €{s.price}
@@ -89,7 +89,7 @@ export default function Services() {
               </ul>
             </div>
             <button
-              onClick={() => navigate('/start')}
+              onClick={() => navigate('/buchen')}
               className="mt-6 flex h-11 w-full items-center justify-center gap-2 rounded-xl border border-copper/50 text-xs font-bold uppercase tracking-[0.18em] text-copper-2 transition-all hover:bg-copper hover:text-ink"
             >
               <CalendarCheck size={15} aria-hidden /> {t('nav.book')}
