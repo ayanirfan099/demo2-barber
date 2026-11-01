@@ -1,4 +1,4 @@
-# Vienna Cuts — React booking and voice demo
+# Vienna Cuts — Booking Demo with Optional AI Receptionist
 
 A bilingual German/English fictional barbershop application with service selection, appointment availability and an owner dashboard. It runs locally without a backend; Supabase, Stripe, Resend and Vapi integrations require separate configuration.
 
