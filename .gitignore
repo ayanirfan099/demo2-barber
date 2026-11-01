@@ -3,3 +3,11 @@ node_modules/
 dist/
 build/
 .DS_Store
+.env.*
+!.env.example
+coverage/
+playwright-report/
+test-results/
+.vscode/
+.idea/
+*.tsbuildinfo
